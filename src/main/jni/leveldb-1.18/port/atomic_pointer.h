@@ -19,14 +19,9 @@
 #define PORT_ATOMIC_POINTER_H_
 
 #include <stdint.h>
-#ifdef LEVELDB_ATOMIC_PRESENT
-#include <atomic>
-#endif
+
 #ifdef OS_WIN
 #include <windows.h>
-#endif
-#ifdef OS_MACOSX
-#include <libkern/OSAtomic.h>
 #endif
 
 #if defined(_M_X64) || defined(__x86_64__)
@@ -35,6 +30,8 @@
 #define ARCH_CPU_X86_FAMILY 1
 #elif defined(__ARMEL__)
 #define ARCH_CPU_ARM_FAMILY 1
+#elif defined(__aarch64__)
+#define ARCH_CPU_ARM64_FAMILY 1
 #elif defined(__ppc__) || defined(__powerpc__) || defined(__powerpc64__)
 #define ARCH_CPU_PPC_FAMILY 1
 #elif defined(__mips__)
@@ -42,25 +39,25 @@
 #endif
 
 namespace leveldb {
-namespace port {
+    namespace port {
 
 // Define MemoryBarrier() if available
 // Windows on x86
 #if defined(OS_WIN) && defined(COMPILER_MSVC) && defined(ARCH_CPU_X86_FAMILY)
-// windows.h already provides a MemoryBarrier(void) macro
+        // windows.h already provides a MemoryBarrier(void) macro
 // http://msdn.microsoft.com/en-us/library/ms684208(v=vs.85).aspx
 #define LEVELDB_HAVE_MEMORY_BARRIER
 
 // Mac OS
-#elif defined(OS_MACOSX)
-inline void MemoryBarrier() {
-  OSMemoryBarrier();
+#elif defined(__APPLE__)
+        inline void MemoryBarrier() {
+  std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 #define LEVELDB_HAVE_MEMORY_BARRIER
 
 // Gcc on x86
 #elif defined(ARCH_CPU_X86_FAMILY) && defined(__GNUC__)
-inline void MemoryBarrier() {
+        inline void MemoryBarrier() {
   // See http://gcc.gnu.org/ml/gcc/2003-04/msg01180.html for a discussion on
   // this idiom. Also see http://en.wikipedia.org/wiki/Memory_ordering.
   __asm__ __volatile__("" : : : "memory");
@@ -69,7 +66,7 @@ inline void MemoryBarrier() {
 
 // Sun Studio
 #elif defined(ARCH_CPU_X86_FAMILY) && defined(__SUNPRO_CC)
-inline void MemoryBarrier() {
+        inline void MemoryBarrier() {
   // See http://gcc.gnu.org/ml/gcc/2003-04/msg01180.html for a discussion on
   // this idiom. Also see http://en.wikipedia.org/wiki/Memory_ordering.
   asm volatile("" : : : "memory");
@@ -78,7 +75,7 @@ inline void MemoryBarrier() {
 
 // ARM Linux
 #elif defined(ARCH_CPU_ARM_FAMILY) && defined(__linux__)
-typedef void (*LinuxKernelMemoryBarrierFunc)(void);
+        typedef void (*LinuxKernelMemoryBarrierFunc)(void);
 // The Linux ARM kernel provides a highly optimized device-specific memory
 // barrier function at a fixed memory address that is mapped in every
 // user-level process.
@@ -94,9 +91,16 @@ inline void MemoryBarrier() {
 }
 #define LEVELDB_HAVE_MEMORY_BARRIER
 
+// ARM64
+#elif defined(ARCH_CPU_ARM64_FAMILY)
+        inline void MemoryBarrier() {
+            asm volatile("dmb sy" : : : "memory");
+        }
+#define LEVELDB_HAVE_MEMORY_BARRIER
+
 // PPC
 #elif defined(ARCH_CPU_PPC_FAMILY) && defined(__GNUC__)
-inline void MemoryBarrier() {
+        inline void MemoryBarrier() {
   // TODO for some powerpc expert: is there a cheaper suitable variant?
   // Perhaps by having separate barriers for acquire and release ops.
   asm volatile("sync" : : : "memory");
@@ -112,30 +116,32 @@ inline void MemoryBarrier() {
 
 #endif
 
-// AtomicPointer built using platform-specific MemoryBarrier()
+// AtomicPointer built using platform-specific MemoryBarrier().
 #if defined(LEVELDB_HAVE_MEMORY_BARRIER)
-class AtomicPointer {
- private:
-  void* rep_;
- public:
-  AtomicPointer() { }
-  explicit AtomicPointer(void* p) : rep_(p) {}
-  inline void* NoBarrier_Load() const { return rep_; }
-  inline void NoBarrier_Store(void* v) { rep_ = v; }
-  inline void* Acquire_Load() const {
-    void* result = rep_;
-    MemoryBarrier();
-    return result;
-  }
-  inline void Release_Store(void* v) {
-    MemoryBarrier();
-    rep_ = v;
-  }
-};
+        class AtomicPointer {
+        private:
+            void* rep_;
+        public:
+            AtomicPointer() { }
+            explicit AtomicPointer(void* p) : rep_(p) {}
+            inline void* NoBarrier_Load() const { return rep_; }
+            inline void NoBarrier_Store(void* v) { rep_ = v; }
+            inline void* Acquire_Load() const {
+                void* result = rep_;
+                MemoryBarrier();
+                return result;
+            }
+            inline void Release_Store(void* v) {
+                MemoryBarrier();
+                rep_ = v;
+            }
+        };
 
-// AtomicPointer based on <cstdatomic>
-#elif defined(LEVELDB_ATOMIC_PRESENT)
-class AtomicPointer {
+// AtomicPointer based on C++11 <atomic>.
+#else
+        #include <atomic>
+
+        class AtomicPointer {
  private:
   std::atomic<void*> rep_;
  public:
@@ -155,78 +161,15 @@ class AtomicPointer {
   }
 };
 
-// Atomic pointer based on sparc memory barriers
-#elif defined(__sparcv9) && defined(__GNUC__)
-class AtomicPointer {
- private:
-  void* rep_;
- public:
-  AtomicPointer() { }
-  explicit AtomicPointer(void* v) : rep_(v) { }
-  inline void* Acquire_Load() const {
-    void* val;
-    __asm__ __volatile__ (
-        "ldx [%[rep_]], %[val] \n\t"
-         "membar #LoadLoad|#LoadStore \n\t"
-        : [val] "=r" (val)
-        : [rep_] "r" (&rep_)
-        : "memory");
-    return val;
-  }
-  inline void Release_Store(void* v) {
-    __asm__ __volatile__ (
-        "membar #LoadStore|#StoreStore \n\t"
-        "stx %[v], [%[rep_]] \n\t"
-        :
-        : [rep_] "r" (&rep_), [v] "r" (v)
-        : "memory");
-  }
-  inline void* NoBarrier_Load() const { return rep_; }
-  inline void NoBarrier_Store(void* v) { rep_ = v; }
-};
-
-// Atomic pointer based on ia64 acq/rel
-#elif defined(__ia64) && defined(__GNUC__)
-class AtomicPointer {
- private:
-  void* rep_;
- public:
-  AtomicPointer() { }
-  explicit AtomicPointer(void* v) : rep_(v) { }
-  inline void* Acquire_Load() const {
-    void* val    ;
-    __asm__ __volatile__ (
-        "ld8.acq %[val] = [%[rep_]] \n\t"
-        : [val] "=r" (val)
-        : [rep_] "r" (&rep_)
-        : "memory"
-        );
-    return val;
-  }
-  inline void Release_Store(void* v) {
-    __asm__ __volatile__ (
-        "st8.rel [%[rep_]] = %[v]  \n\t"
-        :
-        : [rep_] "r" (&rep_), [v] "r" (v)
-        : "memory"
-        );
-  }
-  inline void* NoBarrier_Load() const { return rep_; }
-  inline void NoBarrier_Store(void* v) { rep_ = v; }
-};
-
-// We have neither MemoryBarrier(), nor <atomic>
-#else
-#error Please implement AtomicPointer for this platform.
-
 #endif
 
 #undef LEVELDB_HAVE_MEMORY_BARRIER
 #undef ARCH_CPU_X86_FAMILY
 #undef ARCH_CPU_ARM_FAMILY
+#undef ARCH_CPU_ARM64_FAMILY
 #undef ARCH_CPU_PPC_FAMILY
 
-}  // namespace port
+    }  // namespace port
 }  // namespace leveldb
 
 #endif  // PORT_ATOMIC_POINTER_H_
