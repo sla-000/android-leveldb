@@ -9,4 +9,5 @@ local.properties
 .idea
 .metadata
 .settings
+.externalNativeBuild/*
 *~
